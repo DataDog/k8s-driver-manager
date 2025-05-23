@@ -14,7 +14,7 @@ COPY go.sum go.sum
 COPY vendor vendor
 COPY cmd/nvdrain cmd/nvdrain
 
-RUN go build -o nvdrain ./cmd/nvdrain
+RUN CGO_ENABLED=1 GOEXPERIMENT=boringcrypto go build -tags fips -o nvdrain ./cmd/nvdrain && go tool nm nvdrain | grep -E 'sig.FIPSOnly'
 
 FROM registry.ddbuild.io/images/nvidia-cuda-base:12.9.0
 
