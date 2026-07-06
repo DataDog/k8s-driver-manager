@@ -175,10 +175,10 @@ func (c *Client) UncordonNode(nodeName string) error {
 func (c *Client) WaitForPodTermination(selectorMap map[string]string, namespace, nodeName string, timeout time.Duration) error {
 	selector := labels.SelectorFromSet(selectorMap)
 
-	return wait.PollUntilContextTimeout(c.ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextTimeout(c.ctx, kubeClientPollInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		pods, err := c.clientset.CoreV1().Pods(namespace).List(c.ctx, metav1.ListOptions{
 			LabelSelector: selector.String(),
-			FieldSelector: "spec.nodeName=" + nodeName,
+			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
 		})
 		if err != nil {
 			return false, err

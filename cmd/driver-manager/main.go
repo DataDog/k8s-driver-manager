@@ -100,6 +100,7 @@ type componentState struct {
 	draDriverDeployed           string
 	draValidatorDeployed        string
 	customOperandNodeLabelValue string
+	gpuClientsDeployed          string
 	autoUpgradePolicyEnabled    string
 }
 
@@ -664,6 +665,10 @@ func (dm *DriverManager) evictAllGPUOperatorComponents() error {
 		operandLabels[dm.config.nodeLabelForGPUPodEviction] = dm.maybeSetPaused(dm.components.customOperandNodeLabelValue)
 	}
 
+	if dm.components.gpuClientsDeployed != "" {
+		operandLabels[nvidiaGPUClientDeployLabel] = dm.maybeSetPaused(dm.components.gpuClientsDeployed)
+	}
+
 	// Update the node
 	err := dm.kubeClient.UpdateNodeLabels(dm.config.nodeName, operandLabels)
 	if err != nil {
@@ -791,6 +796,15 @@ func (dm *DriverManager) waitForPodsToTerminate() error {
 		}
 		if err := dm.kubeClient.WaitForPodTermination(selectorMap, namespace, nodeName, defaultGracePeriod); err != nil {
 			dm.log.Errorf("Failed to wait for vgpu-device-manager to shutdown: %v", err)
+			return err
+		}
+	}
+
+	// Wait for any pods whose parent controller uses nvidia.com/gpu.deploy.client as a nodeSelector key.
+	if dm.components.gpuClientsDeployed != "" {
+		dm.log.Infof("Waiting for any daemon set pods with nodeSelector key %s to terminate", nvidiaGPUClientDeployLabel)
+		if err := dm.kubeClient.WaitForPodsWithNodeSelector(nodeName, nvidiaGPUClientDeployLabel, defaultGracePeriod); err != nil {
+			dm.log.Errorf("Failed to wait for GPU client pods to terminate: %v", err)
 			return err
 		}
 	}
@@ -1036,6 +1050,10 @@ func (dm *DriverManager) rescheduleGPUOperatorComponents() error {
 	// Handle custom operand node selector label
 	if dm.components.customOperandNodeLabelValue != "" {
 		operandLabels[dm.config.nodeLabelForGPUPodEviction] = dm.maybeSetTrue(dm.components.customOperandNodeLabelValue)
+	}
+
+	if dm.components.gpuClientsDeployed != "" {
+		operandLabels[nvidiaGPUClientDeployLabel] = dm.maybeSetTrue(dm.components.gpuClientsDeployed)
 	}
 
 	// Update the node
