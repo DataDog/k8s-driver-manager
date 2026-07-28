@@ -29,6 +29,7 @@ import (
 	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -186,6 +187,64 @@ func (c *Client) WaitForPodTermination(selectorMap map[string]string, namespace,
 		// Return true if no pods are found (all terminated)
 		return len(pods.Items) == 0, nil
 	})
+}
+
+// WaitForPodsWithNodeSelector waits for all daemon set pods on the given node which has the specified key in
+// its nodeSelector to terminate.
+func (c *Client) WaitForPodsWithNodeSelector(nodeName, nodeSelectorKey string, timeout time.Duration) error {
+	return wait.PollUntilContextTimeout(c.ctx, kubeClientPollInterval, timeout, true, func(ctx context.Context) (bool, error) {
+		podList, err := c.clientset.CoreV1().Pods(corev1.NamespaceAll).List(ctx, metav1.ListOptions{
+			FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
+		}
+
+		matchCount := 0
+		for _, pod := range podList.Items {
+			ownerRef := metav1.GetControllerOf(&pod)
+			if ownerRef == nil || ownerRef.Kind != "DaemonSet" {
+				continue
+			}
+			if _, ok := pod.Spec.NodeSelector[nodeSelectorKey]; ok {
+				matchCount++
+			}
+		}
+
+		if matchCount > 0 {
+			c.log.Infof("Waiting for %d daemon set pod(s) with nodeSelector key %q to terminate", matchCount, nodeSelectorKey)
+		}
+		return matchCount == 0, nil
+	})
+}
+
+// GetGPUResourceClaimHolders returns the namespaced names of the pods on the node which
+// still hold a ResourceClaim allocated by the NVIDIA GPU DRA driver, i.e. the pods the
+// kubelet still needs the DRA kubelet-plugin to unprepare. Pods in a terminal phase are
+// excluded, since the kubelet has unprepared their claims by then.
+func (c *Client) GetGPUResourceClaimHolders(nodeName string) ([]string, error) {
+	podList, err := c.clientset.CoreV1().Pods(corev1.NamespaceAll).List(c.ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", nodeName).String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
+	}
+
+	var holders []string
+	for _, pod := range podList.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		hasClaim, err := c.podHasGPUResourceClaim(pod)
+		if err != nil {
+			return nil, err
+		}
+		if hasClaim {
+			holders = append(holders, pod.Namespace+"/"+pod.Name)
+		}
+	}
+
+	return holders, nil
 }
 
 // DrainNode drains a Node given a Node name and a set of drain option parameters
