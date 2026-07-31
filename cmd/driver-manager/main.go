@@ -62,6 +62,9 @@ const (
 	nvidiaSandboxValidatorDeployLabel    = nvidiaDomainPrefix + "/" + "gpu.deploy.sandbox-validator"
 	nvidiaSandboxDevicePluginDeployLabel = nvidiaDomainPrefix + "/" + "gpu.deploy.sandbox-device-plugin"
 	nvidiaVGPUDeviceManagerDeployLabel   = nvidiaDomainPrefix + "/" + "gpu.deploy.vgpu-device-manager"
+	nvidiaGPUClientDeployLabel           = nvidiaDomainPrefix + "/" + "gpu.deploy.client"
+	nvidiaDRADriverDeployLabel           = nvidiaDomainPrefix + "/" + "gpu.deploy.dra-driver"
+	nvidiaDRAValidatorDeployLabel        = nvidiaDomainPrefix + "/" + "gpu.deploy.dra-validator"
 )
 
 // Configuration holds all the configuration from environment variables
@@ -94,7 +97,10 @@ type componentState struct {
 	sandboxValidatorDeployed    string
 	sandboxPluginDeployed       string
 	vgpuDeviceManagerDeployed   string
+	draDriverDeployed           string
+	draValidatorDeployed        string
 	customOperandNodeLabelValue string
+	gpuClientsDeployed          string
 	autoUpgradePolicyEnabled    string
 }
 
@@ -290,7 +296,65 @@ func (dm *DriverManager) uninstallDriver() error {
 		return fmt.Errorf("failed to fetch auto upgrade annotation: %w", err)
 	}
 
-	// Always evict all GPU operator components across a driver restart
+	// No driver loaded (node reboot or fresh install): nothing holds the driver, so
+	// skip eviction. Evicting here deadlocks on DRA nodes: terminating a claim-holding
+	// pod needs the kubelet-plugin, which cannot start until the driver install
+	// proceeds.
+	if !dm.isDriverLoaded() {
+		dm.log.Info("No NVIDIA driver loaded, skipping eviction of GPU clients and workloads")
+
+		// Restart the kubelet-plugin: it stays bound to the previous driver rootfs
+		// and would fail to prepare claims against the replacement. Drain it before
+		// unmounting that rootfs so the unmount is not done underneath it.
+		if err := dm.evictKubeletPlugin(); err != nil {
+			return fmt.Errorf("failed to evict DRA kubelet-plugin: %w", err)
+		}
+
+		// Clean up stale artifacts from a previous driver container
+		if err := dm.unmountRootfs(); err != nil {
+			return fmt.Errorf("failed to unmount stale rootfs: %w", err)
+		}
+		dm.removePIDFile()
+
+		// Unload nouveau if present; it blocks the driver install
+		if dm.isNouveauLoaded() {
+			if err := dm.unloadNouveau(); err != nil {
+				return fmt.Errorf("failed to unload nouveau driver: %w", err)
+			}
+			dm.log.Info("Successfully unloaded nouveau driver")
+		}
+
+		// Handle vfio-pci driver unbinding
+		if err := dm.unbindVfioPCI(); err != nil {
+			dm.log.Error("Unable to unbind vfio-pci driver from all devices")
+			return fmt.Errorf("failed to unbind vfio-pci driver: %w", err)
+		}
+
+		// Handle GPUDirect RDMA if enabled
+		// When GPUDirectRDMA is enabled, wait until MOFED driver has finished installing
+		if dm.isGPUDirectRDMAEnabled() {
+			dm.log.Info("GPUDirectRDMA is enabled, validating MOFED driver installation")
+			if err := dm.waitForMofedDriver(); err != nil {
+				return fmt.Errorf("failed to wait for MOFED driver: %w", err)
+			}
+		}
+
+		if dm.isGPUPodEvictionEnabled() || dm.isAutoDrainEnabled() {
+			if err := dm.kubeClient.UncordonNode(dm.config.nodeName); err != nil {
+				dm.log.Warnf("Failed to uncordon node: %v", err)
+			}
+		}
+
+		if err := dm.rescheduleGPUOperatorComponents(); err != nil {
+			return fmt.Errorf("failed to reschedule GPU operator components: %w", err)
+		}
+		return nil
+	}
+
+	// Always evict all GPU operator components across a driver restart. The DRA
+	// kubelet-plugin is the exception: it services NodeUnprepareResources for the
+	// claim-holders evicted here (e.g. dra-validator), so it must outlive them and
+	// is drained separately afterwards (see evictKubeletPlugin).
 	if err := dm.evictAllGPUOperatorComponents(); err != nil {
 		dm.log.Error("Failed to evict GPU operator components, attempting cleanup")
 		dm.cleanupOnFailure()
@@ -299,6 +363,17 @@ func (dm *DriverManager) uninstallDriver() error {
 
 	if dm.shouldSkipUninstall() {
 		dm.log.Info("The NVIDIA driver is already loaded with the desired version and configuration, skipping the uninstallation of the driver in an attempt to not disrupt running workloads")
+
+		// The DRA kubelet-plugin bind-mounts the previous driver container's rootfs.
+		// That bind does not track the host mount point, so the replacement driver
+		// container's rootfs never appears inside the running plugin and, once the
+		// stale rootfs is unmounted below, its submounts (e.g. dev/) vanish from the
+		// plugin's view, leaving NodePrepareResources unable to build CDI specs.
+		// Restart the plugin across the rotation so it re-binds the new rootfs.
+		if err := dm.evictKubeletPlugin(); err != nil {
+			dm.cleanupOnFailure()
+			return fmt.Errorf("failed to evict DRA kubelet-plugin: %w", err)
+		}
 
 		// Clean up stale artifacts from previous container before rescheduling operands
 		dm.log.Info("Cleaning up stale mounts and state files...")
@@ -324,8 +399,10 @@ func (dm *DriverManager) uninstallDriver() error {
 		PodSelector:        dm.config.drainPodSelectorLabel,
 	}
 
-	// Delete any GPU pods running on the node
-	if dm.isGPUPodEvictionEnabled() {
+	// Delete any GPU pods running on the node. With DRA, evict GPU pods up front:
+	// the post-unload auto-drain fallback runs after the kubelet-plugin is gone,
+	// leaving drained claim-holders stuck in Terminating.
+	if dm.isGPUPodEvictionEnabled() || (dm.components.draDriverDeployed != "" && dm.isAutoDrainEnabled()) {
 		if err := dm.kubeClient.CordonNode(dm.config.nodeName); err != nil {
 			return fmt.Errorf("failed to cordon node: %w", err)
 		}
@@ -341,11 +418,30 @@ func (dm *DriverManager) uninstallDriver() error {
 				dm.cleanupOnFailure()
 				return fmt.Errorf("failed to drain node: %w", err)
 			}
-			if err := dm.cleanupDriver(); err != nil {
-				dm.cleanupOnFailure()
-				return fmt.Errorf("failed to cleanup NVIDIA driver: %w", err)
-			}
 		}
+	}
+
+	// The eviction above and the auto-drain fallback below are both disabled when the GPU
+	// Operator's upgrade policy owns the drain, so confirm the claim-holders are gone
+	// rather than assuming it: without the plugin they cannot finish terminating.
+	if dm.components.draDriverDeployed != "" {
+		holders, err := dm.kubeClient.GetGPUResourceClaimHolders(dm.config.nodeName)
+		if err != nil {
+			dm.cleanupOnFailure()
+			return fmt.Errorf("failed to check for GPU resource claim holders: %w", err)
+		}
+		if len(holders) > 0 {
+			dm.cleanupOnFailure()
+			return fmt.Errorf("cannot drain the DRA kubelet-plugin: pod(s) still hold GPU resource claims: %s", strings.Join(holders, ", "))
+		}
+	}
+
+	// Drain the kubelet-plugin after the claim-holders and GPU workloads are gone but
+	// before the driver is unloaded, so the kubelet can still reach it to release their
+	// DRA claims.
+	if err := dm.evictKubeletPlugin(); err != nil {
+		dm.cleanupOnFailure()
+		return fmt.Errorf("failed to evict DRA kubelet-plugin: %w", err)
 	}
 
 	// Check if driver is loaded and cleanup if needed
@@ -461,6 +557,9 @@ func (dm *DriverManager) fetchCurrentLabels() error {
 		nvidiaSandboxValidatorDeployLabel,
 		nvidiaSandboxDevicePluginDeployLabel,
 		nvidiaVGPUDeviceManagerDeployLabel,
+		nvidiaGPUClientDeployLabel,
+		nvidiaDRADriverDeployLabel,
+		nvidiaDRAValidatorDeployLabel,
 	}
 
 	for _, label := range operandLabels {
@@ -511,6 +610,12 @@ func (dm *DriverManager) setComponentState(label, value string) {
 		dm.components.sandboxPluginDeployed = value
 	case nvidiaVGPUDeviceManagerDeployLabel:
 		dm.components.vgpuDeviceManagerDeployed = value
+	case nvidiaGPUClientDeployLabel:
+		dm.components.gpuClientsDeployed = value
+	case nvidiaDRADriverDeployLabel:
+		dm.components.draDriverDeployed = value
+	case nvidiaDRAValidatorDeployLabel:
+		dm.components.draValidatorDeployed = value
 	}
 }
 
@@ -548,10 +653,20 @@ func (dm *DriverManager) evictAllGPUOperatorComponents() error {
 		operandLabels[nvidiaMIGManagerDeployLabel] = dm.maybeSetPaused(dm.components.migManagerDeployed)
 	}
 
+	// The dra-validator holds a DRA claim, so it drains here with the other clients. The
+	// kubelet-plugin that services that claim is drained separately, after them.
+	if dm.components.draValidatorDeployed != "" {
+		operandLabels[nvidiaDRAValidatorDeployLabel] = dm.maybeSetPaused(dm.components.draValidatorDeployed)
+	}
+
 	// Handle custom operand node selector label
 	if dm.components.customOperandNodeLabelValue != "" {
 		dm.log.Infof("Shutting down GPU clients using node selector label %q=%s", dm.config.nodeLabelForGPUPodEviction, dm.components.customOperandNodeLabelValue)
 		operandLabels[dm.config.nodeLabelForGPUPodEviction] = dm.maybeSetPaused(dm.components.customOperandNodeLabelValue)
+	}
+
+	if dm.components.gpuClientsDeployed != "" {
+		operandLabels[nvidiaGPUClientDeployLabel] = dm.maybeSetPaused(dm.components.gpuClientsDeployed)
 	}
 
 	// Update the node
@@ -562,6 +677,34 @@ func (dm *DriverManager) evictAllGPUOperatorComponents() error {
 
 	// Wait for pods to terminate
 	return dm.waitForPodsToTerminate()
+}
+
+// evictKubeletPlugin drains the DRA kubelet-plugin after the other GPU clients, not in
+// the same batch. It services NodeUnprepareResources for every claim-holder (e.g.
+// dra-validator, gpu-feature-discovery), so it must outlive them; draining it alongside
+// them would deadlock, since they cannot finish terminating without it.
+func (dm *DriverManager) evictKubeletPlugin() error {
+	if dm.components.draDriverDeployed == "" {
+		return nil
+	}
+
+	dm.log.Info("Draining the DRA kubelet-plugin (last, after its claim-holding clients)")
+	operandLabels := map[string]string{
+		nvidiaDRADriverDeployLabel: dm.maybeSetPaused(dm.components.draDriverDeployed),
+	}
+	if err := dm.kubeClient.UpdateNodeLabels(dm.config.nodeName, operandLabels); err != nil {
+		return err
+	}
+
+	dm.log.Info("Waiting for dra-driver to shutdown")
+	selectorMap := map[string]string{
+		"app": "nvidia-dra-driver-kubelet-plugin",
+	}
+	if err := dm.kubeClient.WaitForPodTermination(selectorMap, dm.config.operatorNamespace, dm.config.nodeName, defaultGracePeriod); err != nil {
+		dm.log.Errorf("Failed to wait for dra-driver to shutdown: %v", err)
+		return err
+	}
+	return nil
 }
 
 func (dm *DriverManager) maybeSetPaused(currentValue string) string {
@@ -583,12 +726,19 @@ func (dm *DriverManager) waitForPodsToTerminate() error {
 		app     string
 		timeout time.Duration
 	}{
+		// The ClusterPolicy and GPUCluster validators intentionally share this pod
+		// label so the upgrade controller and driver-manager use the same readiness
+		// and shutdown gate.
 		{"nvidia-operator-validator", defaultGracePeriod},
 		{"nvidia-container-toolkit-daemonset", defaultGracePeriod},
 		{"nvidia-device-plugin-daemonset", defaultGracePeriod},
 		{"gpu-feature-discovery", defaultGracePeriod},
 		{"nvidia-dcgm-exporter", defaultGracePeriod},
 		{"nvidia-dcgm", defaultGracePeriod},
+		// The DRA-mode DCGM operands share the gpu.deploy.dcgm* node-selector
+		// labels with the ones above but carry distinct app labels.
+		{"nvidia-dcgm-exporter-dra", defaultGracePeriod},
+		{"nvidia-dcgm-dra", defaultGracePeriod},
 	}
 
 	namespace := dm.config.operatorNamespace
@@ -646,6 +796,15 @@ func (dm *DriverManager) waitForPodsToTerminate() error {
 		}
 		if err := dm.kubeClient.WaitForPodTermination(selectorMap, namespace, nodeName, defaultGracePeriod); err != nil {
 			dm.log.Errorf("Failed to wait for vgpu-device-manager to shutdown: %v", err)
+			return err
+		}
+	}
+
+	// Wait for any pods whose parent controller uses nvidia.com/gpu.deploy.client as a nodeSelector key.
+	if dm.components.gpuClientsDeployed != "" {
+		dm.log.Infof("Waiting for any daemon set pods with nodeSelector key %s to terminate", nvidiaGPUClientDeployLabel)
+		if err := dm.kubeClient.WaitForPodsWithNodeSelector(nodeName, nvidiaGPUClientDeployLabel, defaultGracePeriod); err != nil {
+			dm.log.Errorf("Failed to wait for GPU client pods to terminate: %v", err)
 			return err
 		}
 	}
@@ -880,9 +1039,21 @@ func (dm *DriverManager) rescheduleGPUOperatorComponents() error {
 		operandLabels[nvidiaMIGManagerDeployLabel] = dm.maybeSetTrue(dm.components.migManagerDeployed)
 	}
 
+	if dm.components.draDriverDeployed != "" {
+		operandLabels[nvidiaDRADriverDeployLabel] = dm.maybeSetTrue(dm.components.draDriverDeployed)
+	}
+
+	if dm.components.draValidatorDeployed != "" {
+		operandLabels[nvidiaDRAValidatorDeployLabel] = dm.maybeSetTrue(dm.components.draValidatorDeployed)
+	}
+
 	// Handle custom operand node selector label
 	if dm.components.customOperandNodeLabelValue != "" {
 		operandLabels[dm.config.nodeLabelForGPUPodEviction] = dm.maybeSetTrue(dm.components.customOperandNodeLabelValue)
+	}
+
+	if dm.components.gpuClientsDeployed != "" {
+		operandLabels[nvidiaGPUClientDeployLabel] = dm.maybeSetTrue(dm.components.gpuClientsDeployed)
 	}
 
 	// Update the node
